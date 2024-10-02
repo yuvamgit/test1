@@ -1,1 +1,454 @@
-this is second file
+---
+# This role is based on https://access.redhat.com/documentation/en-us/reference_architectures/2017/html-single/deploying_oracle_database_12c_release_2_on_red_hat_enterprise_linux_7
+# Need to add cvuqdisk !!!
+- set_fact:
+    all_nodes: "{{ hostnames.split(',') }}"
+- name: Ensure Oracle limits file is updated
+  become: True
+  template:
+    src: oracle-limits.conf.j2
+    dest: /etc/security/limits.d/80-oracle-limits.conf
+    owner: root
+    group: root
+    mode: 0644
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - groups
+ 
+- name: Ensure the /etc/login.group.allowed.d/oracletp file is up to date
+  become: True
+  copy:
+    src: logingroupallowed_oracletp
+    dest: /etc/login.group.allowed.d/oracletp
+    owner: root
+    group: root
+    mode: 0644
+  register: login_group_allowed
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - groups
+
+- name: Make sure oracle sudoers is in place
+  become: True
+  copy:
+    src: sudoersd_oracletp
+    dest: /etc/sudoers.d/oracletp
+    owner: root
+    group: root
+    mode: 0440
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - groups
+
+- name: Run /etc/cron.hourly/linuxts-logingroup
+  become: True
+  command: /etc/cron.hourly/linuxts-logingroup
+  when: login_group_allowed.changed
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - groups
+
+#- name: Ensure we have the correct permissions on the mounts
+ # become: True
+  #file:
+   # path: /u01
+    #owner: oracle
+    #group: oinstall
+    #mode: 0775
+  # Detect if a mount point has been re-mounted. This indicates the device is encrypted and should be left alone.
+  #when: "item not in (ansible_mounts | map(attribute='device') | list)"
+  #delegate_to: "{{item}}"
+  #with_items: "{{ all_nodes }}"
+  #tags:
+  # - fs
+
+- name: Ensure oracle.sh is in place
+  become: True
+  copy:
+    src: oracle.sh
+    dest: /etc/profile.d/oracle.sh
+    owner: root
+    group: root
+    mode: 0644 
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - swap
+
+- name: Make sure oraInst.loc is in place
+  become: True
+  copy:
+    src: oraInst.loc
+    dest: /etc/oraInst.loc
+    owner: root
+    group: root
+    mode: 0644
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - swap
+
+#- name: Ensure /etc/rc.d/init.d/oraclesingledb is in place
+#  become: True
+#  copy:
+#    src: oraclesingledb
+#    dest: /etc/rc.d/init.d/oraclesingledb
+#    owner: root
+#    group: root
+#    mode: 0755
+#
+#- name: Make sure oraclesingledb service is enabled
+#  become: True
+#  service:
+#    name: oraclesingledb
+#    enabled: yes
+#- name: create new disk partitions
+#  become: True
+#  parted:
+#   device: "{{ item }}"
+#   number: 1
+#   state: present
+#  with_items: "{{ devices }}"
+#  delegate_to: "{{ all_nodes[0] }}"
+#  tags:
+#    - part_devices
+
+#- name: ASM configure
+#  become: true
+#  command:  /usr/sbin/oracleasm configure -u grid -g asmadmin -s y
+#  delegate_to: "{{item}}"
+#  with_items: "{{ all_nodes }}"
+#  tags:
+#     - oracleasm
+#- name: ASM exit
+#  become: true
+#  shell: |
+#    oracleasm exit
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+
+#- name: ASM init
+#  become: true
+#  shell: |
+#    oracleasm init
+#  delegate_to: "{{item}}"
+#  with_items: "{{ all_nodes }}"  
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk1
+#  become: true
+#  shell: |
+#     oracleasm createdisk "OCRS_{{CLUSTER_NAME}}_000" /dev/sdc1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk2
+#  become: true
+#  shell: |
+#     oracleasm createdisk "OCRS_{{CLUSTER_NAME}}_001" /dev/sdd1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk3
+#  become: true
+#  shell: |
+#     oracleasm createdisk "OCRS_{{CLUSTER_NAME}}_002" /dev/sde1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk4
+#  become: true
+#  shell: |
+#     oracleasm createdisk "MGMTDB_{{CLUSTER_NAME}}_000" /dev/sdf1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk5
+#  become: true
+#  shell: |
+#     oracleasm createdisk "ARCH_{{CLUSTER_NAME}}_000" /dev/sdg1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk6
+#  become: true
+#  shell: |
+#     oracleasm createdisk "BKUP_{{CLUSTER_NAME}}_000" /dev/sdh1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+#- name: ASM createdisk7
+#  become: true
+#  shell: |
+#     oracleasm createdisk "DATA_{{CLUSTER_NAME}}_000" /dev/sdi1
+#  delegate_to: "{{all_nodes[0]}}"
+#  tags:
+#    - oracleasm
+
+#- name: ASM scandisk
+#  become: true
+#  shell: |
+#     oracleasm scandisks
+#  delegate_to: "{{ item }}"
+#  with_items: "{{ all_nodes }}"
+#  tags:
+#    - oracleasm
+
+- name: Run multipath
+  become: True
+  command: /sbin/multipath
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - disk
+- name: Run lun_scan all
+  become: True
+  command: /usr/sbin/lpfc/lun_scan all
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - disk
+- name: Restart multipath service
+  become: True
+  service:
+    name: multipathd
+    state: restarted
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - disk
+- name: create primary partition u01
+  become: True
+  parted:
+    device: "/dev/mapper/mpath_LVM_u01vg_000"
+    number: 1
+    state: present
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - u01
+- name: Ensure volume groups are set up properly
+  become: True
+  lvg:
+    vg: u01vg
+    pvs: /dev/mapper/mpath_LVM_u01vg_000p1
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+     - u01
+- name: Ensure logical volumes are set up properly
+  become: True
+  lvol:
+    vg: u01vg
+    lv: lv_u01
+    shrink: False
+    size: "{{ u01_size }}G"
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - u01
+- name: Ensure u01 volumes are properly formatted
+  become: True
+  filesystem:
+    fstype: xfs
+    resizefs: True
+    dev: "/dev/mapper/u01vg-lv_u01"
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+- name: Ensure u01 volumes are mounted
+  become: True
+  mount:
+    path: /u01
+    src: "/dev/mapper/u01vg-lv_u01"
+    fstype: xfs
+    state: mounted
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"  
+  #when: "/u01 not in (ansible_mounts | map(attribute='device') | list)"
+  tags:
+    - u01
+- name: Ensure we have the correct permissions on the mounts
+  become: True
+  file:
+    path: /u01
+    owner: oracle
+    group: oinstall
+    mode: 0775
+  #Detect if a mount point has been re-mounted. This indicates the device is encrypted and should be left alone.
+  #when: "item not in (ansible_mounts | map(attribute='device') | list)"
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+   - u01
+
+## 
+- name: Run oracleasm init
+  command: 'oracleasm init'
+  become: True
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - oracleasm
+
+- name: create primary partition OCRS
+  become: True
+  parted:
+    device: "/dev/mapper/mpath_OCRS_{{ cluster_name }}_00{{ item }}"
+    number: 1
+    state: present
+  with_items:
+  - 0
+  - 1
+  - 2
+  tags:
+    - oracleasm
+- name: Run kpartx
+  become: True
+  command: /sbin/kpartx -a "/dev/mapper/mpath_OCRS_{{ cluster_name }}_00{{ item }}"
+  with_items:
+  - 0
+  - 1
+  - 2
+  tags:
+    - oracleasm
+      # Commented out 2022-03-22, Backup is no longer handled by RMAN
+      #- name: create primary partition BKUP
+      #  become: True
+      #  parted:
+      #    device: "/dev/mapper/mpath_BKUP_{{ cluster_name }}_000"
+      #    number: 1
+      #    state: present
+      #  tags:
+      #    - oracleasm
+      #- name: Run kpartx
+      #  become: True
+      #  command: /sbin/kpartx -a "/dev/mapper/mpath_BKUP_{{ cluster_name }}_000"
+      #  tags:
+      #    - oracleasm
+- name: create primary partition DATA
+  become: True
+  parted:
+   device: "/dev/mapper/mpath_DATA_{{ cluster_name }}_000"
+   number: 1
+   state: present
+  tags:
+    - oracleasm
+- name: Run kpartx
+  become: True
+  command: /sbin/kpartx -a "/dev/mapper/mpath_DATA_{{ cluster_name }}_000"
+  tags:
+    - oracleasm
+
+- name: create primary partition ARCH
+  become: True
+  parted:
+   device: "/dev/mapper/mpath_ARCH_{{ cluster_name }}_000"
+   number: 1
+   state: present
+  tags:
+    - oracleasm
+- name: Run kpartx
+  become: True
+  command: /sbin/kpartx -a "/dev/mapper/mpath_ARCH_{{ cluster_name }}_000"
+  tags:
+    - oracleasm
+- name: create primary partition MGMTDB
+  become: True
+  parted:
+   device: "/dev/mapper/mpath_MGMTDB_{{ cluster_name }}_000"
+   number: 1
+   state: present
+  tags:
+    - oracleasm
+- name: Run kpartx
+  become: True
+  command: /sbin/kpartx -a "/dev/mapper/mpath_MGMTDB_{{ cluster_name }}_000"
+  tags:
+    - oracleasm
+- name: Create ASM disk OCRS
+  become: True
+  command: /etc/init.d/oracleasm createdisk "OCRS_{{ cluster_name }}_00{{ item | int }}" "/dev/mapper/mpath_OCRS_{{ cluster_name }}_00{{ item }}p1"
+  with_items:
+  - 0
+  - 1
+  - 2
+  tags:
+    - oracleasm
+      #- name: Create ASM disk BKUP
+      #  become: True
+      #  command: /etc/init.d/oracleasm createdisk "BKUP_{{ cluster_name }}_000" "/dev/mapper/mpath_BKUP_{{ cluster_name }}_000p1"
+      #  tags:
+      #    - oracleasm
+- name: Create ASM disk DATA
+  become: True
+  command: /etc/init.d/oracleasm createdisk "DATA_{{ cluster_name }}_000" "/dev/mapper/mpath_DATA_{{ cluster_name }}_000p1"
+  tags:
+    - oracleasm
+- name: Create ASM disk ARCH
+  become: True
+  command: /etc/init.d/oracleasm createdisk "ARCH_{{ cluster_name }}_000" "/dev/mapper/mpath_ARCH_{{ cluster_name }}_000p1"
+  tags:
+    - oracleasm
+- name: Create ASM disk MGMTDB
+  become: True
+  command: /etc/init.d/oracleasm createdisk "MGMTDB_{{ cluster_name }}_000" "/dev/mapper/mpath_MGMTDB_{{ cluster_name }}_000p1"
+  tags:
+    - oracleasm
+
+
+- name: run multipath v2
+  become: True
+  command: /sbin/multipath -v2
+  delegate_to: "{{ item }}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - oracleasm
+- name: Restart multipath service
+  become: True
+  service:
+    name: multipathd
+    state: restarted
+  delegate_to: "{{ item }}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - oracleasm
+
+- name: ASM exit
+  become: true
+  shell: |
+    oracleasm exit
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - oracleasm
+
+- name: ASM configure
+  become: true
+  command:  /usr/sbin/oracleasm configure -u grid -g asmadmin -s y -o dm -x sd
+  delegate_to: "{{item}}"
+  with_items: "{{ all_nodes }}"
+  tags:
+     - oracleasm
+
+- name: ASM init after configuring user and group
+  become: true
+  shell: |
+    oracleasm init
+  delegate_to: "{{ item }}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - oracleasm
+
+- name: ASM scandisk
+  become: true
+  shell: |
+     oracleasm scandisks
+  delegate_to: "{{ item }}"
+  with_items: "{{ all_nodes }}"
+  tags:
+    - oracleasm
