@@ -1,1 +1,321 @@
-this is fourth file 
+- name: Create in-memory Inventory containing all hosts that will be Removed
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Loop over ikea_hosts and add hosts to inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name | lower }}"
+        groups: in_memory
+        hostgroup: "{{ item.hostgroup }}"
+      loop: "{{ ikea_hosts }}"
+
+- name: Add disk
+  hosts: in_memory
+  gather_facts: false
+  vars_files:
+    - vars/main.yml
+
+  roles:
+    - role: delete_vm_nutanix
+    - role: collect_ip_info
+    - role: remove_ip
+    - role: force_failure
+
+# role: delete_vm_nutanix
+
+---
+- name: Getting Admin IP config via IPAM
+  ansible.builtin.uri:
+    url: "{{ ipam_url }}/{{ inventory_hostname }}"
+    method: GET
+    return_content: true
+  register: ip_prod_collect
+  delegate_to: localhost
+
+- name: If host not in IPAM
+  when:
+    - ip_prod_collect.content is match('^Could')
+  delegate_to: localhost
+  block:
+    - name: Set fail logic
+      ansible.builtin.set_fact:
+        fail: true
+        ritm_msg:
+          - "Ansible Job ID: {{ tower_job_id }}"
+          - "Host not in IPAM."
+
+    - name: Run RITM info update
+      ansible.builtin.include_role:
+        name: update_ritm
+      when:
+        - snow_facts.ritm is defined
+        - snow_facts.ritm != ""
+
+    - name: Error message
+      ansible.builtin.fail:
+        msg: "{{ ritm_msg }}"
+
+# - name: Set IPAM data
+#   when: datacenter is undefined
+#   block:
+#     - name: Get VM iformation from API lookup
+#       ansible.builtin.uri:
+#         url: "{{ ipam_dc_lookup }}/{{ inventory_hostname }}"
+#         method: GET
+#         return_content: true
+#         validate_certs: false
+#       retries: 3
+#       delay: 5
+#       until: ipam_output.status == 200
+#       register: ipam_output
+#       delegate_to: localhost
+
+#     - name: Set dc and env facts
+#       ansible.builtin.set_fact:
+#         host_name: "{{ ipam_output.json[0]['name'] }}"
+#         datacenter: "{{ ipam_output.json[0]['datacenter'] }}"
+#         virt_env: "{{ ipam_output.json[0]['virt_env'] }}"
+
+- name: Check if host exists and retrive VM UUID
+  block:
+    - name: Retrieve VM UUID
+      nutanix.ncp.ntnx_vms_info:
+        nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+        nutanix_username: "{{ nutanix_secrets.username }}"
+        nutanix_password: "{{ nutanix_secrets.password }}"
+        validate_certs: "{{ validate_certs }}"
+        filter:
+          name: "{{ inventory_hostname }}"
+      register: vm_info
+      connection: local
+
+  rescue:
+    - name: Server does not exists
+      ansible.builtin.debug:
+        msg: "Sever does not exists in {{ datacenter }}"
+
+    - name: End play with success
+      ansible.builtin.meta: end_play
+
+- name: Remove the Host and Clean up PVLANs (if any)
+  when: vm_info.response.entities | length == 1
+  block:
+    - name: Delete VM in Nutanix
+      vars:
+        datacenter: '{{ hostgroup.split("/")[2] | upper }}'
+      nutanix.ncp.ntnx_vms:
+        nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+        nutanix_username: "{{ nutanix_secrets.username }}"
+        nutanix_password: "{{ nutanix_secrets.password }}"
+        state: absent
+        validate_certs: "{{ validate_certs }}"
+        vm_uuid: "{{ vm_info.response.entities | map(attribute='metadata.uuid') | first }}"
+      delegate_to: localhost
+
+    - name: If there are PVLANs in the deployment, include pvlan_isolate role
+      vars:
+        pvlan_isolate_tag: 'remove'
+        ntx_cluster: "{{ vm_info.response.entities[0].status.cluster_reference.name }}"
+        nic_list_pvlans: "{{ vm_info.response.entities[0].spec.resources.nic_list |
+          selectattr('subnet_reference.name', 'search', 'PVLAN') }}"
+      ansible.builtin.include_role:
+        name: pvlan_isolate
+      when: nic_list_pvlans != []
+
+- name: Make sure host is absent in sat.ikea.com
+  redhat.satellite.host:
+    server_url: "{{ satellite }}"
+    username: "{{ satellite_secrets.satellite_admin }}"
+    password: "{{ satellite_secrets.satellite_adminpassword }}"
+    name: "{{ inventory_hostname }}"
+    validate_certs: "{{ validate_certs }}"
+    state: absent
+  delegate_to: localhost
+  no_log: true
+  when: inventory_hostname is search('lx')
+
+- name: Remove host from Tower inventories
+  ansible.controller.host:
+    controller_host: "{{ tower_server_url }}"
+    controller_username: "{{ tower_secrets.launcher_account_user | default(omit) }}"
+    controller_password: "{{ tower_secrets.launcher_account| default(omit) }}"
+    controller_oauthtoken: "{{ tower_secrets.launcher_account_token | default(omit) }}"
+    validate_certs: "{{ validate_certs }}"
+    name: "{{ inventory_hostname }}"
+    inventory: "{{ tower_static_inventory }}"
+    state: absent
+  delegate_to: localhost
+  when: inventory_hostname is search('lx')
+
+# role: collect_ip_info
+
+---
+# Collect IP information
+- name: Getting Public IP config via IPAM
+  ansible.builtin.uri:
+    url: "{{ ipam_url }}/{{ inventory_hostname }}"
+    method: GET
+    return_content: true
+  register: ip_prod_collect
+  delegate_to: localhost
+
+- name: Getting Admin IP config via IPAM
+  ansible.builtin.uri:
+    url: "{{ ipam_url }}/{{ inventory_hostname | replace('.com', 'a.com') }}"
+    method: GET
+    return_content: true
+  register: ip_adm_collect
+  delegate_to: localhost
+
+# Format collected IP information
+- name: Format Public IP Information
+  vars:
+    ip_info: "{{ ip_prod_collect.content }}"
+  ansible.builtin.set_fact:
+    ip_prod:
+      json:
+        ip: "{{ ip_info.IP | default(None) }}"
+        network: "{{ ip_info.NETWORK | default(None) }}"
+        gateway: "{{ ip_info.GATEWAY | default(None) }}"
+        netmask: "{{ ip_info.NETMASK | default(None) }}"
+        prefix: "{{ ip_info.PREFIX  | default(None) }}"
+        dns1: "{{ ip_info.DNS1 | default(None) }}"
+        dns2: "{{ ip_info.DNS2 | default(None) }}"
+        vlan:
+          "{%if ip_info.Private_VLAN | default('No') == 'Yes' %}\
+            {{ ip_info.VLANID_Isolate | default(None) }}\
+          {%else %}\
+            {{ ip_info.VLANID | default(None) }}\
+          {%endif %}"
+
+- name: Format Admin IP Information
+  vars:
+    ip_info: "{{ ip_adm_collect.content }}"
+  ansible.builtin.set_fact:
+    ip_adm:
+      json:
+        ip: "{{ ip_info.IP | default(None) }}"
+        network: "{{ ip_info.NETWORK | default(None) }}"
+        gateway: "{{ ip_info.GATEWAY | default(None) }}"
+        netmask: "{{ ip_info.NETMASK | default(None) }}"
+        prefix: "{{ ip_info.PREFIX  | default(None) }}"
+        dns1: "{{ ip_info.DNS1 | default(None) }}"
+        dns2: "{{ ip_info.DNS2 | default(None) }}"
+        vlan:
+          "{% if ip_info.Private_VLAN | default('No') == 'Yes' %}\
+            {{ ip_info.VLANID_Isolate | default(None) }}\
+          {% else %}\
+            {{ ip_info.VLANID | default(None) }}\
+          {% endif %}"
+
+- name: Check if prod IP exists
+  when: not ip_prod.json.ip
+  vars:
+    ritm_msg:
+      - "Public IP not found in IPAM"
+  block:
+    - name: Update RITM
+      when:
+        - snow_facts.ritm is defined
+        - snow_facts.ritm
+      ansible.builtin.debug:
+        msg: "{{ ritm_msg }}"
+
+    - name: Fail if prod IP does not exist
+      ansible.builtin.fail:
+        msg: "{{ ritm_msg }}"
+
+
+    # role: remove_ip
+
+---
+- name: Remove Hostname and IP in IPAM
+  when: ip_prod.json.ip is defined and ip_prod.json.ip
+  no_log: true
+  ansible.builtin.uri:
+    url: "{{ remove_ip_url }}/{{ ip_prod.json.ip }}"
+    method: DELETE
+    headers:
+      accept: application/json
+      Authorization: "bearer {{ ngen_secrets.ngen_token }}"
+  delegate_to: localhost
+  register: ipam_remove
+
+- name: Remove Admin Hostname and Admin IP in IPAM
+  when: ip_adm.json.ip is defined and ip_adm.json.ip
+  no_log: true
+  ansible.builtin.uri:
+    url: "{{ remove_ip_url }}/{{ ip_adm.json.ip }}"
+    method: DELETE
+    headers:
+      accept: application/json
+      Authorization: "bearer {{ ngen_secrets.ngen_token }}"
+  delegate_to: localhost
+  register: ipam_remove
+
+- name: Update RITM # noqa var-naming[no-role-prefix]
+  when:
+    - snow_facts.ritm is defined
+    - snow_facts.ritm != ""
+  vars:
+    ritm_msg: "{{ ipam_remove }}"
+  ansible.builtin.include_role:
+    name: update_ritm
+
+# role: force_failure
+
+---
+- name: Forcing Failure
+  when: force_failed is undefined
+  ansible.builtin.fail:
+    msg: "Forced failure even if play is success"
+  delegate_to: localhost
+
+# role: remove_host
+
+---
+- name: Retrieve VM UUID
+  nutanix.ncp.ntnx_vms_info:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: "{{ validate_certs }}"
+    filter:
+      name: "{{ inventory_hostname.split('.')[0] | upper }}"
+  register: vm_info
+  delegate_to: localhost
+
+- name: Delete VM in Nutanix
+  when: vm_info.response.metadata.length | int != 0
+  nutanix.ncp.ntnx_vms:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    state: absent
+    validate_certs: "{{ validate_certs }}"
+    vm_uuid: "{{ vm_info.response.entities | map(attribute='metadata.uuid') | first }}"
+  delegate_to: localhost
+
+- name: Deallocate Hostname and IP in IPAM
+  no_log: true
+  ansible.builtin.uri:
+    url: "https://itseelm-lx42302.ikea.com:9092/ngen/remove/{{ item }}"
+    method: DELETE
+    headers:
+      accept: application/json
+      Authorization: "bearer {{ ngen_secrets.ngen_token }}"
+  delegate_to: localhost
+  register: deallocated_hostnames
+  loop: "{{ [[ip_prod.json.ip] + [ip_adm.json.ip | default(none)]] | flatten(levels=1, skip_nulls=True) }}"
+
+- name: Remove cloud-init file
+  ansible.builtin.file:
+    path: "cloud-init-{{ inventory_hostname.split('.')[0] }}.yml"
+    state: absent
+  delegate_to: localhost
+
+- name: Trigger failure
+  ansible.builtin.fail:
+    msg: Cleaned up host in Nutanix and removed IP from IPAM.
+
