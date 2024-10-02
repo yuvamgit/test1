@@ -1,1 +1,584 @@
-this is third file
+- name: Create in-memory Inventory containing all hosts that will be deployed
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Loop over ikea_hosts and add hosts to inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name | lower }}"
+        groups: in_memory
+        hostgroup: "{{ item.hostgroup }}"
+        variables: "{{ item.variables }}"
+        compute_attributes: "{{ item.compute_attributes | default(omit) }}"
+        extra_groups: "{{ item.groups | default(omit) }}"
+        ts_template_id: "{{ item.template_id | default(omit) }}"
+        ansible_connection: local
+      loop: "{{ ikea_hosts }}"
+
+- name: Provision hosts
+  hosts: in_memory
+  gather_facts: false
+  vars_files:
+    - vars/main.yml
+
+  roles:
+    - role: set_facts
+    - role: collect_ip_info
+    - role: ntx_subnet
+    - role: list_templates
+    # - role: ntx_categories
+    - role: deploy_nutanix_guest
+
+#  role: set_facts
+---
+- name: Update RITM with Ansible Job ID # noqa var-naming[no-role-prefix]
+  when: snow_facts.ritm is defined and snow_facts.ritm
+  vars:
+    ritm_msg:
+      - "Ansible Job ID: {{ tower_job_id }}"
+  ansible.builtin.include_role:
+    name: update_ritm
+
+- name: Set datacenter
+  ansible.builtin.set_fact:
+    datacenter: '{{ hostgroup.split("/")[2] | upper }}'
+  delegate_to: localhost
+
+- name: Set Nutanix Cluster for Linux
+  when: inventory_hostname is search("lx")
+  ansible.builtin.set_fact:
+    ntx_cluster: "{{ compute_attributes.cluster | default(variables.cluster | default(nutanix_cluster[datacenter].cluster_name)) }}"
+  delegate_to: localhost
+
+- name: Set Nutanix Cluster for Windows
+  when: (inventory_hostname is search("nt")) or (inventory_hostname is search("win"))
+  ansible.builtin.set_fact:
+    ntx_cluster: "{{ compute_attributes.cluster | default(variables.cluster | default(nutanix_nt_cluster[datacenter].cluster_name)) }}"
+  delegate_to: localhost
+
+- name: Set Nutanix Cluster for Blackboxes
+  when: hostgroup is search("BB")
+  ansible.builtin.set_fact:
+    ntx_cluster: "{{ ntx_cluster | default(nutanix_cluster[datacenter].cluster_name) }}"
+  delegate_to: localhost
+
+- name: Set Linux TS
+  when: inventory_hostname is search("lx")
+  ansible.builtin.set_fact:
+    dist: '{{ hostgroup.split("/")[1] | regex_search("[a-zA-Z]+") | upper }}'
+    os: '{{ hostgroup.split("/")[1] | regex_search("[a-zA-Z]+") | upper + "-" + hostgroup.split("/")[1] | regex_search("[0-9]+") }}'
+    regex_pattern_image: ".*{{ ntx_cluster }}"
+  delegate_to: localhost
+
+- name: Set Windows version
+  when: inventory_hostname is search("nt")
+  ansible.builtin.set_fact:
+    dist: '{{ hostgroup.split("/")[1] | regex_search("[a-zA-Z]+") }}'
+    os: '{{ hostgroup.split("/")[1] }}'
+    regex_pattern_image: "{% if inventory_hostname is search('ikead') %}^.*DT.*{{ ntx_cluster }}{% else %}^(?!.*_DT).*{{ ntx_cluster }}{% endif %}"
+  delegate_to: localhost
+
+- name: Set Windows SOE version
+  when: inventory_hostname is search("win")
+  ansible.builtin.set_fact:
+    dist: '{{ hostgroup.split("/")[1] | regex_search("[a-zA-Z]+") }}'
+    os: '{{ hostgroup.split("/")[1] }}'
+    regex_pattern_image: '{{ hostgroup.split("/")[1] }}'
+  delegate_to: localhost
+
+- name: Set Blackboxes dist
+  when: hostgroup is search("BB")
+  ansible.builtin.set_fact:
+    dist: '{{ hostgroup.split("/")[1] | regex_search("[a-zA-Z]+") | upper }}'
+  delegate_to: localhost
+
+# role: collect_ip_info
+
+---
+# Collect IP information
+- name: Getting Public IP config via IPAM
+  ansible.builtin.uri:
+    url: "{{ ipam_url }}/{{ inventory_hostname }}"
+    method: GET
+    return_content: true
+  register: ip_prod_collect
+  delegate_to: localhost
+
+- name: Getting Admin IP config via IPAM
+  ansible.builtin.uri:
+    url: "{{ ipam_url }}/{{ inventory_hostname | replace('.com', 'a.com') }}"
+    method: GET
+    return_content: true
+  register: ip_adm_collect
+  delegate_to: localhost
+
+# Format collected IP information
+- name: Format Public IP Information
+  vars:
+    ip_info: "{{ ip_prod_collect.content }}"
+  ansible.builtin.set_fact:
+    ip_prod:
+      json:
+        ip: "{{ ip_info.IP | default(None) }}"
+        network: "{{ ip_info.NETWORK | default(None) }}"
+        gateway: "{{ ip_info.GATEWAY | default(None) }}"
+        netmask: "{{ ip_info.NETMASK | default(None) }}"
+        prefix: "{{ ip_info.PREFIX  | default(None) }}"
+        dns1: "{{ ip_info.DNS1 | default(None) }}"
+        dns2: "{{ ip_info.DNS2 | default(None) }}"
+        vlan:
+          "{%if ip_info.Private_VLAN | default('No') == 'Yes' %}\
+            {{ ip_info.VLANID_Isolate | default(None) }}\
+          {%else %}\
+            {{ ip_info.VLANID | default(None) }}\
+          {%endif %}"
+
+- name: Format Admin IP Information
+  vars:
+    ip_info: "{{ ip_adm_collect.content }}"
+  ansible.builtin.set_fact:
+    ip_adm:
+      json:
+        ip: "{{ ip_info.IP | default(None) }}"
+        network: "{{ ip_info.NETWORK | default(None) }}"
+        gateway: "{{ ip_info.GATEWAY | default(None) }}"
+        netmask: "{{ ip_info.NETMASK | default(None) }}"
+        prefix: "{{ ip_info.PREFIX  | default(None) }}"
+        dns1: "{{ ip_info.DNS1 | default(None) }}"
+        dns2: "{{ ip_info.DNS2 | default(None) }}"
+        vlan:
+          "{% if ip_info.Private_VLAN | default('No') == 'Yes' %}\
+            {{ ip_info.VLANID_Isolate | default(None) }}\
+          {% else %}\
+            {{ ip_info.VLANID | default(None) }}\
+          {% endif %}"
+
+- name: Check if prod IP exists
+  when: not ip_prod.json.ip
+  vars:
+    ritm_msg:
+      - "Public IP not found in IPAM"
+  block:
+    - name: Update RITM
+      when:
+        - snow_facts.ritm is defined
+        - snow_facts.ritm
+      ansible.builtin.debug:
+        msg: "{{ ritm_msg }}"
+
+    - name: Fail if prod IP does not exist
+      ansible.builtin.fail:
+        msg: "{{ ritm_msg }}"
+
+# role: ntx_subnet
+---
+- name: Update RITM # noqa: run-once var-naming[no-role-prefix]
+  when:
+    - snow_facts.ritm is defined and snow_facts.ritm
+  vars:
+    ritm_msg: |
+      Nutanix subnet:
+      {% for item in groups.in_memory -%}
+        {{ item }}
+      {% endfor %}
+  ansible.builtin.include_role:
+    name: update_ritm
+  run_once: true
+
+- name: Include pub.yml
+  ansible.builtin.include_tasks:
+    file: pub.yml
+
+- name: Include adm.yml
+  ansible.builtin.include_tasks:
+    file: adm.yml
+  when: ip_adm.json.vlan is defined and ip_adm.json.vlan != ""
+
+- name: Create Network Configuration Structure
+  ansible.builtin.set_fact:
+    ntx_nw_config: "{{ lookup('ansible.builtin.template', 'nw_config.j2') | from_yaml }}"
+
+- name: Print ntx_nw_config
+  ansible.builtin.debug:
+    var: ntx_nw_config
+# File adm.yml
+---
+- name: Search for subnet using admin vlan
+  nutanix.ncp.ntnx_subnets_info:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: false
+    filter:
+      name: ".*{{ ip_adm.json.vlan | regex_replace('([0-9])', '[\\1]') }}.*"
+    length: 500
+  register: adm_subnet_info
+
+- name: Set nutanix admin subnet fact
+  vars:
+    regex_str: "(?<![0-9]){{ ip_adm.json.vlan }}(?![0-9])"
+  ansible.builtin.set_fact:
+    ntx_adm_subnet: "{{ adm_subnet_info.response.entities
+     | selectattr('status.state', 'search', 'COMPLETE')
+     | selectattr('spec.cluster_reference', 'search', ntx_cluster)
+     | selectattr('spec.name', 'regex', regex_str)
+     | map(attribute='spec.name')
+     | list
+     | first }}"
+
+- name: Assert that Admin VLAN exists
+  ansible.builtin.assert:
+    that: ntx_adm_subnet | length >= 1
+    fail_msg: "{{ ntx_adm_subnet }} does not exist in {{ nutanix_secrets.nutanix_host }}"
+    success_msg: "{{ ntx_adm_subnet }} exists in {{ nutanix_secrets.nutanix_host }}"
+# File pub.yml
+---
+- name: Search for subnet using vlan
+  nutanix.ncp.ntnx_subnets_info:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: false
+    filter:
+      name: ".*{{ ip_prod.json.vlan | regex_replace('([0-9])', '[\\1]') }}.*"
+    length: 500
+  register: subnet_info
+
+- name: Set nutanix subnet fact
+  vars:
+    regex_str: "^{{ ip_prod.json.vlan }}$"
+  ansible.builtin.set_fact:
+    ntx_subnet: "{{ subnet_info.response.entities
+      | selectattr('status.state', 'search', 'COMPLETE')
+      | selectattr('spec.cluster_reference', 'search', ntx_cluster)
+      | selectattr('spec.resources.vlan_id', 'regex', regex_str)
+      | map(attribute='spec.name')
+      | list
+      | first }}"
+
+- name: Assert that VLAN exists
+  ansible.builtin.assert:
+    that: ntx_subnet | length >= 1
+    fail_msg: "{{ ntx_subnet }} does not exist in {{ nutanix_secrets.nutanix_host }}"
+    success_msg: "vlan{{ ntx_subnet }} exists in {{ nutanix_secrets.nutanix_host }}"
+
+
+# role: list_templates
+---
+- name: Update RITM # noqa: run-once var-naming[no-role-prefix]
+  when:
+    - snow_facts.ritm is defined and snow_facts.ritm
+  vars:
+    ritm_msg: |
+      List templates:
+      {% for item in groups.in_memory -%}
+        {{ item }}
+      {% endfor %}
+  ansible.builtin.include_role:
+    name: update_ritm
+  run_once: true
+
+- name: Find suitable image if no image has been explictly stated under compute_attributes.image
+  when: compute_attributes.image is not defined
+  block:
+    - name: List images
+      nutanix.ncp.ntnx_images_info:
+        nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+        nutanix_username: "{{ nutanix_secrets.username }}"
+        nutanix_password: "{{ nutanix_secrets.password }}"
+        validate_certs: false
+        filter:
+          name: ".*{{ os | regex_replace('([a-zA-Z0-9])', '[\\1]') }}.*"
+      register: result
+      delegate_to: localhost
+
+    - name: Select install image
+      ansible.builtin.set_fact:
+        image: "{{ result.response.entities | map(attribute='spec.name') | select('match', regex_pattern_image) | list | last }}"
+
+    - name: Assert that we found at least one valid image
+      ansible.builtin.assert:
+        that:
+          - image is defined
+          - image | length >= 1
+        success_msg: "Found {{ image | length }}, continuing"
+        fail_msg: "Did not find any images to use"  
+
+# - role: ntx_categories
+
+---
+# - name: Collect valid Cost Centers based on LDAP groups
+#   ansible.builtin.uri:
+#     url: "{{ cc_url }}"
+#     headers:
+#       accept: application/json
+#   register: valid_cc
+#
+# - name: Assert that entered Cost Center is valid
+#   vars:
+#     cc: "{{ variables.cc | string }}"
+#     cc_all: "{{ valid_cc.json | map(attribute='cc') | list }}"
+#   ansible.builtin.assert:
+#     that: cc in cc_all
+#     success_msg: "{{ cc }} is a valid Cost Center"
+#     fail_msg: "{{ cc }} is not a valid Cost Center. Check {{ cc_url }} for valid CCs"
+
+- name: Update RITM # noqa: run-once var-naming[no-role-prefix]
+  when:
+    - snow_facts.ritm is defined and snow_facts.ritm
+  vars:
+    ritm_msg: |
+      NTX catagories:
+      {% for item in groups.in_memory -%}
+        {{ item }}
+      {% endfor %}
+  ansible.builtin.include_role:
+    name: update_ritm
+  run_once: true
+
+- name: Add values to CostCenter category
+  nutanix.ncp.ntnx_categories:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: false
+    state: present
+    name: "CostCenter"
+    values:
+      - "{{ variables.cc | default('') | regex_search('[0-9]+') | default('default', 'n/a') }}"
+
+# role: deploy_nutanix_guest
+
+---
+- name: Update RITM # noqa: run-once var-naming[no-role-prefix]
+  when:
+    - snow_facts.ritm is defined and snow_facts.ritm
+  vars:
+    ritm_msg: |
+      Deploying host:
+      {% for item in groups.in_memory -%}
+        {{ item }}
+      {% endfor %}
+  ansible.builtin.include_role:
+    name: update_ritm
+  run_once: true
+
+- name: Update RITM with Ansible Job ID
+  when:
+    - ritm is defined
+    - ritm != ""
+  block:
+    - name: Set RITM message
+      ansible.builtin.set_fact:
+        ritm_msg:
+          - "Deploy host: Peform base installation"
+      delegate_to: localhost
+
+    - name: Run RITM info update
+      ansible.builtin.include_role:
+        name: update_ritm
+
+- name: Import Linux Pre Tasks
+  when: inventory_hostname is search("lx")
+  ansible.builtin.import_tasks:
+    file: linux_pre_tasks.yml
+
+- name: Import WinSOE Pre Tasks
+  when: inventory_hostname is search("win")
+  ansible.builtin.import_tasks:
+    file: winsoe_pre_tasks.yml
+
+- name: Import Deploy Host
+  ansible.builtin.import_tasks:
+    file: deploy_host.yml
+
+- name: Import Linux Post Tasks.yml
+  when: inventory_hostname is search("lx")
+  ansible.builtin.import_tasks:
+    file: linux_post_tasks.yml
+
+- name: Import WinSOE Post Tasks.yml
+  when: inventory_hostname is search("win")
+  ansible.builtin.import_tasks:
+    file: winsoe_post_tasks.yml
+# file deploy_host
+
+- name: Check if VM name already exists in Nutanix
+  nutanix.ncp.ntnx_vms_info:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: "{{ validate_certs }}"
+    filter:
+      vm_name: "{{ inventory_hostname }}"
+  register: vm_info
+  delegate_to: localhost
+
+- name: Assert that VM name is unique
+  ansible.builtin.assert:
+    that: vm_info.response.metadata.length | int == 0
+    fail_msg: |
+      "{{ vm_info.response.metadata.length }} instance(s) of
+      {{ inventory_hostname }} found in
+      {{ nutanix_secrets.nutanix_host }}"
+    success_msg: "{{ inventory_hostname }} not in use"
+
+- name: set fact disk template
+  ansible.builtin.set_fact:
+    disk_template: "{% if inventory_hostname is search('win') %}disk_list_winsoe.j2{% else %}disk_list.j2{% endif %}"
+
+- name: Create Virtual Machine
+  nutanix.ncp.ntnx_vms:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: "{{ validate_certs }}"
+    state: "{{ host_os[dist].power_state }}"
+    name: "{{ inventory_hostname }}"
+    guest_customization: "{{ host_os[dist].guest_customization | default(omit) }}"
+    boot_config: "{{ host_os[dist].boot_config | default(omit) }}"
+    cluster:
+      name: "{{ ntx_cluster }}"
+    networks: "{{ ntx_nw_config }}"
+    disks: "{{ lookup('ansible.builtin.template', disk_template) | from_yaml }}"
+    vcpus: "{{ compute_attributes.cpus | default(cpus) }}"
+    cores_per_vcpu: "{{ compute_attributes.cores | default(cores) }}"
+    memory_gb: "{{ compute_attributes.memory | default(memory) }}"
+    # categories:
+    #   CostCenter:
+    #     - "{{ variables.cc | default('') | regex_search('[0-9]+') | default('default', 'n/a') }}"
+  delegate_to: localhost
+  register: vm_create
+
+- name: If there are PVLANs in the deployment, include pvlan_isolate role # noqa: var-naming[no-role-prefix]
+  vars:
+    nic_list_pvlans: "{{ vm_create.response.spec.resources.nic_list |
+      selectattr('subnet_reference.name', 'search', 'PVLAN') }}"
+    pvlan_isolate_tag: 'add'
+  ansible.builtin.include_role:
+    name: pvlan_isolate
+  when: nic_list_pvlans != []
+
+# file linux_post_task.yml
+---
+- name: Waiting for SSH to be available
+  ansible.builtin.wait_for:
+    timeout: 300
+    host: "{{ inventory_hostname }}"
+    port: 22
+  delegate_to: localhost
+
+- name: Remove cloud-init file
+  ansible.builtin.file:
+    path: "cloud-init-{{ inventory_hostname.split('.')[0] }}.yml"
+    state: absent
+  delegate_to: localhost
+
+- name: Search for CDROM(S)
+  ansible.builtin.set_fact:
+    available_cdroms: "{{ vm_create.response.spec.resources.disk_list
+      | selectattr('device_properties.device_type', 'equalto', 'CDROM')
+      | map(attribute='uuid')
+      | list }}"
+  delegate_to: localhost
+
+- name: Run tasks to remove cdrom from VM
+  when:
+    - available_cdroms | length > 0
+  block:
+    - name: Create list of cdroms to be removed
+      ansible.builtin.set_fact:
+        cdrom_list: "{{ cdrom_list | default([]) + [{'uuid': item, 'state': 'absent'}] }}"
+      loop: "{{ available_cdroms }}"
+      delegate_to: localhost
+
+    - name: Make sure cdroms are removed from server (will reboot the server)
+      nutanix.ncp.ntnx_vms:
+        nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+        nutanix_username: "{{ nutanix_secrets.username }}"
+        nutanix_password: "{{ nutanix_secrets.password }}"
+        validate_certs: "{{ validate_certs }}"
+        vm_uuid: "{{ vm_create.vm_uuid }}"
+        disks: "{{ cdrom_list }}"
+        force_power_off: true
+      delegate_to: localhost
+
+    - name: Waiting for SSH to be available after reboot
+      ansible.builtin.wait_for:
+        timeout: 300
+        host: "{{ inventory_hostname }}"
+        port: 22
+      delegate_to: localhost
+
+- name: Configure Admin Interface (if Admin IP is defined in IPAM)
+  when:
+    - ip_adm.json.ip is defined
+    - ip_adm.json.ip
+    - dist == 'RHEL'
+  become: true
+  vars:
+    ansible_connection: ssh
+  block:
+    - name: Template ens4 configuration
+      ansible.builtin.template:
+        src: ifcfg-ens4.j2
+        dest: /etc/sysconfig/network-scripts/ifcfg-ens4
+        mode: '0644'
+
+    - name: Reload NetworkManager
+      ansible.builtin.command: nmcli con reload
+      register: nmcli_con_reload
+      changed_when: nmcli_con_reload.rc != 0
+
+    - name: Up Admin NIC
+      ansible.builtin.command: nmcli con up ens4
+      register: nmcli_con_up
+      changed_when: nmcli_con_up.rc != 0
+
+    - name: Clean up unused NetworkManager Profiles
+      ansible.builtin.shell: |
+        set -o pipefail
+        for i in $(nmcli -f uuid,device con | grep -v -e 'ens' -e 'UUID' | awk {'print $1'})
+        do
+          nmcli con del $i
+        done
+      register: nmcli_con_del
+      changed_when: nmcli_con_del.rc != 0
+
+- name: Activate all NICs (including admin)
+  when: ip_adm.json.ip is defined and ip_adm.json.ip
+  nutanix.ncp.ntnx_vms:
+    nutanix_host: "{{ nutanix_secrets.nutanix_host }}"
+    nutanix_username: "{{ nutanix_secrets.username }}"
+    nutanix_password: "{{ nutanix_secrets.password }}"
+    validate_certs: "{{ validate_certs }}"
+    vm_uuid: "{{ vm_create.vm_uuid }}"
+    networks:
+      - is_connected: true
+        uuid: "{{ vm_create.response.spec.resources.nic_list[0].uuid }}"
+      - is_connected: true
+        uuid: "{{ vm_create.response.spec.resources.nic_list[1].uuid }}"
+  delegate_to: localhost
+
+# file linux_pre_task.yml
+
+---
+- name: Create cloud-init file
+  when: dist == 'RHEL'
+  vars:
+    ip: "{{ (ip_prod.json.ip + '/' + ip_prod.json.netmask) | ansible.utils.ipaddr('address/prefix') }}"
+  ansible.builtin.template:
+    src: "cloud-init.yml.j2"
+    dest: "cloud-init-{{ inventory_hostname.split('.')[0] }}.yml"
+    mode: "0644"
+  delegate_to: localhost
+
+- name: Create cloud-init file
+  when: dist == 'UBUNTU'
+  vars:
+    ip: "{{ (ip_prod.json.ip + '/' + ip_prod.json.netmask) | ansible.utils.ipaddr('address/prefix') }}"
+  ansible.builtin.template:
+    src: "ubuntu-cloud-init.yml.j2"
+    dest: "cloud-init-{{ inventory_hostname.split('.')[0] }}.yml"
+    mode: "0644"
+  delegate_to: localhost
