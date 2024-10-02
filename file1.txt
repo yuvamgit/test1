@@ -1,1 +1,111 @@
-this is the testing file for rebase
+    - name: Ensure required package installed
+      become: true
+      yum:
+        name: lvm2*
+        state: present
+      register: package_check
+      delegate_to: "{{inventory_hostname}}"
+
+    - debug: var=package_check
+
+    - name: Install the required package
+      block:
+        - name: perform installation
+          become: true
+          yum:
+            name: lvm2*
+            state: latest
+          register: package_install
+          delegate_to: "{{inventory_hostname}}"
+
+        - debug:
+            msg: "Latest Package installed...."
+          when: package_install.rc == 0
+        - fail:
+             msg: "Unable to install.."
+          when: package_install.rc != 0
+      when: "'already installed' not in package_check.results"
+
+
+
+
+    - name: Enable and create multipath conf file
+      become: True
+      command: /sbin/mpathconf --enable
+      register: mpath_install
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Scan the newly added lun
+      become: True
+      command: /usr/sbin/lpfc/lun_scan all
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Re-scan the lun with scsi
+      become: True
+      command: /usr/bin/rescan-scsi-bus.sh
+      register: lun_scsi
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Restart the multipathd service
+      become: True
+      service:
+        name: multipathd
+        state: restarted
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Backup the lun from binding file
+      become: True
+      copy:
+        src: /etc/multipath/bindings
+        dest: /tmp/bkp_lun             #include date
+        owner: root
+        group: root
+        mode: 0644
+      delegate_to: "{{inventory_hostname}}"
+
+
+##################################
+    - name: Create primary partition for u01 disk
+      become: True
+      parted:
+        device: "/dev/mapper/mpath_LVM_u01vg_000"
+        state: present
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Create volume group for u01 disk
+      become: True
+      lvg:
+        vg: u01vg
+        pvs: /dev/mapper/mpath_LVM_u01vg_000p1
+      delegate_to: "{{inventory_hostname}}"
+    
+    - name: Create logical volume for u01 disk
+      become: True
+      lvol:
+        vg: u01vg
+        lv: lv_u01
+        shrink: False
+        size: "198G"                    ## not a fixed value
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Format u01 disk in xfs
+      become: True
+      filesystem:
+        fstype: xfs
+        resizefs: True
+        dev: "/dev/mapper/u01vg-lv_u01"
+      delegate_to: "{{inventory_hostname}}"
+
+    - name: Create u01 file system directory
+      become: True
+      command: "mkdir /u01"
+      delegate_to: "{{inventory_hostname}}"
+      
+    - name: Mount the u01 disk
+      become: True
+      mount:
+        path: /u01
+        src: "/dev/mapper/u01vg-lv_u01"
+        fstype: xfs
+        state: mounted
+      delegate_to: "{{inventory_hostname}}"
